@@ -6,6 +6,8 @@
 ## Participate
 - [Support flexible input sizes #883](https://github.com/webmachinelearning/webnn/issues/883)
 - [Composite operators / subgraphs #907](https://github.com/webmachinelearning/webnn/issues/907)
+- [Build-time metadata #965](https://github.com/webmachinelearning/webnn/issues/965)
+- [Stateful model #966](https://github.com/webmachinelearning/webnn/issues/966)
 
 ## Table of contents
 1. [Introduction](#introduction)
@@ -31,11 +33,11 @@ Based on our proof of concept, this explainer describes what it takes to run an 
 - **Two are met by features already under discussion.** Flexible input shapes, from the [Dynamic Shape explainer](https://github.com/webmachinelearning/webnn/blob/main/dynamic-shape-explainer.md), and composite operators and subgraphs, from [webmachinelearning/webnn#907](https://github.com/webmachinelearning/webnn/issues/907). This explainer adopts them as [dependencies](#dependencies-on-non-stable-features) and does not redefine them.
 - **Two are met by additions this explainer proposes.** A [stateful model](#stateful-model) keeps the KV cache inside the model across dispatches: the page marks which graph inputs and outputs carry the cache, and the underlying implementation keeps it as internal state. [Build-time metadata](#build-time-metadata) lets the page tell the underlying implementation how it intends to drive the model.
 
-These four mechanisms only describe the model; they do not say how to run it. Each underlying implementation decides that for itself, so the same graph runs on any of them. [Implementation Experience](#implementation-experience-openvino-on-intel-npu) shows one example from our proof of concept on Intel NPU through OpenVINO, which relies on three optimizations: static decomposition, KV cache management, and pattern matching and fusion.
+These four proposals only describe the model; they do not say how to run it. Each underlying implementation decides that for itself, so the same graph runs on any of them. [Implementation Experience](#implementation-experience-openvino-on-intel-npu) shows one example from our proof of concept on Intel NPU through OpenVINO, which relies on three optimizations: static decomposition, KV cache management, and pattern matching and fusion.
 
-The figure below shows, for each challenge, the WebNN mechanism that meets it and the OpenVINO optimization that implements it on the NPU:
+The figure below shows, for each challenge, the WebNN proposal that meets it and the OpenVINO optimization that implements it on the NPU:
 
-![Each dynamic LM challenge maps to a WebNN mechanism and an OpenVINO NPU optimization: dynamic prompt length to flexible input shapes and static decomposition; LM-specific operators to composite operators and subgraphs and pattern matching and fusion; growing decode KV cache to the stateful model and KV cache management; usage intent to build-time metadata, which also feeds static decomposition](content/dynamic-lm-overview.svg)
+![Each dynamic LM challenge maps to a WebNN proposal and an OpenVINO NPU optimization: dynamic prompt length to flexible input shapes and static decomposition; LM-specific operators to composite operators and subgraphs and pattern matching and fusion; growing decode KV cache to the stateful model and KV cache management; usage intent to build-time metadata, which also feeds static decomposition](content/dynamic-lm-overview.svg)
 
 ## Goals
 - Run a dynamic LM end to end on an NPU through WebNN across an arbitrary prompt length and as many decode steps as the model's context length allows, **without rebuilding the graph**.
@@ -107,15 +109,15 @@ WebNN does not expose these directly today, so a framework lowers each one into 
 **Requirement:** LM computation must be expressible at the level it is defined, in a form every underlying implementation recognizes, so that its intent reaches the kernel.
 
 ### Growing decode KV cache
-After prefill, decode emits one token per step. Each step computes keys and values for a single position and attends over every position seen so far, so the cache grows by one entry per step, per layer. For a stateless model, that cache is an input and an output of every dispatch. Three costs follow:
+After prefill, decode emits one token per step. Each step computes keys and values for a single position and attends over every position seen so far, so the cache grows by one entry per step, per layer. For a stateless model, that cache is an input and an output of every dispatch. With `MLTensor`, the page can keep the cache in device memory across dispatches, passing a handle rather than bytes, so the cost is not a transfer between the page and the device. It is that the graph still produces the whole cache on every step. Three costs follow:
 
-- **Transfer.** The compute of a single decode step is tiny; the copy is proportional to the whole conversation, so the step time grows linearly with context length for reasons that have nothing to do with the model.
-- **Allocation and concatenation.** `newCache = concat(oldCache, newEntry)` allocates a fresh buffer every step and copies the old contents into it — again linear in the context, and it doubles peak memory at the moment of the copy.
+- **Copying.** The compute of a single decode step is tiny, but the graph reads the whole old cache and writes the whole updated cache into another tensor, because a tensor cannot be both an input and an output of one dispatch. The traffic is proportional to the whole conversation, so the step time grows linearly with context length for reasons that have nothing to do with the model.
+- **Allocation and concatenation.** `newCache = concat(oldCache, newEntry)` needs a fresh buffer every step and copies the old contents into it — again linear in the context, and it doubles peak memory at the moment of the copy. Reusing a pair of tensors avoids the allocation but not the copy (see [Ping-pong MLTensors between dispatches](#ping-pong-mltensors-between-dispatches)).
 - **Shape churn.** The cache length changes on every step, so an underlying implementation that specializes per shape has to re-specialize each time.
 
-A stateless API also leaves the page no way to say *this buffer is the same buffer as last time*, which is precisely the fact an underlying implementation needs in order to keep it in device memory and update it in place. In a multi-turn chat the problem extends past a single reply: the cache has to survive from one turn to the next as well.
+A stateless API also leaves the page no way to say *this buffer is the same buffer as last time*, or that the output cache is the input cache plus one entry. That is precisely the fact an underlying implementation needs in order to update the cache in place instead of copying it. In a multi-turn chat the problem extends past a single reply: the cache has to survive from one turn to the next as well.
 
-**Requirement:** the KV cache must persist across dispatches and across turns, and be updatable without crossing the API boundary.
+**Requirement:** the KV cache must persist across dispatches and across turns, and be updatable in place, without the graph rewriting the whole cache on every step.
 
 ### Usage intent on compile-ahead accelerators
 The first three challenges are about describing the *computation*. They do not describe how the page intends to *use* it, and on a compile-ahead accelerator that intent is exactly what the underlying implementation needs in order to choose a strategy. An underlying implementation for such an accelerator may make some of its decisions when the graph is compiled. OpenVINO on the Intel NPU, for example, decides then the longest prompt it compiles a prefill for, how much KV capacity it reserves, and which model variants it builds, and keeps them fixed for the life of the graph (see [Static decomposition](#static-decomposition)).
@@ -125,13 +127,13 @@ A graph with a `'seq_len'` dimension says the length varies; it does not say tha
 **Requirement:** the page must be able to tell the underlying implementation how it will drive the graph at build time.
 
 ### Summary
-The table maps each challenge to its requirement and to the WebNN mechanism that meets it:
+The table maps each challenge to its requirement and to the WebNN proposal that meets it:
 
-| Challenge | Requirement on WebNN | WebNN Mechanism | Status |
+| Challenge | Requirement on WebNN | WebNN Proposal | Status |
 | --- | --- | --- | --- |
 | Dynamic prompt length | One compiled graph accepts a sequence length known only at dispatch | [Flexible input shapes](#flexible-input-shapes) | Dependency |
 | LM-specific operators | LM computation is conveyed in a standard form | [Composite operators and subgraphs](#composite-operators-and-subgraphs) | Dependency |
-| Growing decode KV cache | The cache persists across dispatches and turns without crossing the API boundary | [Stateful model](#stateful-model) | Proposed here |
+| Growing decode KV cache | The cache persists across dispatches and turns and is updated in place, without the graph rewriting it every step | [Stateful model](#stateful-model) | Proposed here |
 | Usage intent on compile-ahead accelerators | The page conveys how it will drive the graph at build time | [Build-time metadata](#build-time-metadata) | Proposed here |
 
 The first two requirements are already addressed by other proposals, so we mark them as *Dependency*; the next section describes what an LM needs from each. The other two are new in this explainer, so we mark them as *Proposed here*; [Proposed API](#proposed-api) defines them.
@@ -180,13 +182,13 @@ The stateful model meets the requirement that dynamic shapes alone cannot: a val
 
 A **stateless** model keeps nothing between runs. Everything a run produces is an output, and everything it needs is an input:
 
-- **The application carries the cache.** To reach the next decode step, the KV cache leaves the model as an output, is held by the application, and comes back in as an input, so it crosses the API boundary twice on every step.
-- **The cost follows the conversation, not the model.** The cache is transferred, and usually reallocated, on every step, so the overhead grows with the context length even though each decode step computes a single token.
+- **The application carries the cache.** To reach the next decode step, the KV cache leaves the model as an output, is held by the application, and comes back in as an input on every step. With `MLTensor` the data can stay in device memory, but the application still has to bind and swap the tensors.
+- **The cost follows the conversation, not the model.** The whole cache is copied on every step, and reallocated as well unless the application reuses a pair of tensors, so the overhead grows with the context length even though each decode step computes a single token.
 - **The application manages the lifecycle.** It supplies the empty cache on the first run, swaps outputs into inputs between runs, and discards the cache when a conversation ends.
 
 A **stateful** model replaces that input/output pair with internal read and write operations: `ReadValue` reads the KV cache at the start of a run, and `AssignValue` writes the updated cache at the end of it. The cache itself lives inside the model, persists between runs, and is never exposed as an input or an output:
 
-- **The cache stays inside the model.** The underlying implementation decides where and in what form to keep it, so it can stay resident in device memory and be updated in place instead of crossing the API boundary on every step.
+- **The cache stays inside the model.** The underlying implementation decides where and in what form to keep it, so it can stay resident in device memory and be updated in place instead of being rewritten as a whole new cache on every step.
 - **The application only passes real inputs and outputs.** It sends `input_ids`, `position_ids`, and `attention_mask`, and reads back `logits`; there are no KV cache tensors to allocate, copy, or swap.
 - **The cache is not visible to the application.** Since the cache is neither an input nor an output, the application cannot read its contents. This costs nothing for the KV cache, which the application never needs to look at, and it is what lets the underlying implementation keep the cache in whatever form suits the device.
 
@@ -323,6 +325,7 @@ const graph = await builder.build(outputs, {
   kvCachePairs,
   metadata: {maxPromptLength: 4096, minResponseLength: 256},
 });
+
 if (!graph.isStateful) {
   // The graph was built stateless: bind past_* and present_* in
   // dispatch() and carry the cache between steps in the app.
@@ -377,7 +380,7 @@ The rules for the stateful model follow the life of a graph: how its caches beha
 #### Semantics
 When `isStateful` is true, each KV cache pair behaves as follows:
 
-- **Lifetime.** A cache is created with the graph and starts empty, with a length of 0. It persists across dispatches until `resetKVCache()` is called or the graph is destroyed. It belongs to that one `MLGraph` and is never shared with another graph, even one built from an identical description.
+- **Lifetime.** A cache is created with the graph and starts empty. It persists across dispatches until `resetKVCache()` is called or the graph is destroyed. It belongs to that one `MLGraph` and is never shared with another graph, even one built from an identical description.
 
 - **Read, then write.** On each dispatch, `input` provides the cache as the previous dispatch left it, or the empty cache before the first dispatch and after `resetKVCache()`. `output` holds the updated cache, which becomes the cache only once the current dispatch completes. A graph can therefore read and update the same cache in one dispatch without a read/write hazard.
 
@@ -405,7 +408,7 @@ Passing build-time validation does not mean the graph will be stateful. Underlyi
 
 1. **WebNN's backend adapts the pairs.** Each underlying implementation has its own requirements, so WebNN's backend for it checks the graph against those requirements as thoroughly as it can and rewrites the pairs into the form that underlying implementation expects. A failed backend check does not fail the build: the backend builds the graph stateless and reports `isStateful` as false. The more the backend checks up front, the fewer stateful builds reach the underlying implementation only to fail there.
 
-2. **The underlying implementation converts the pairs.** WebNN's backend passes the adapted graph and its pairs down, and only the underlying implementation turns each pair into internal state, the `ReadValue` and `AssignValue` of the figure in [Stateful model](#stateful-model). If the conversion or compilation still fails in the underlying implementation, the failure is handled like any other compilation failure: [`MLGraphBuilder.build()`](https://www.w3.org/TR/webnn/#api-mlgraphbuilder-build) rejects with an `OperationError`.
+2. **The underlying implementation converts the pairs.** WebNN's backend passes the adapted graph and its pairs down, and only the underlying implementation turns each pair into internal state, the `ReadValue` and `AssignValue` of the figure in [Stateful model](#stateful-model). If the conversion or compilation still fails in the underlying implementation, the failure can be handled like any other compilation failure: [`MLGraphBuilder.build()`](https://www.w3.org/TR/webnn/#api-mlgraphbuilder-build) rejects with an `OperationError`.
 
 That is why `useStateful` is a request and `isStateful` is reported by the built graph. Only WebNN's backend for a given underlying implementation can tell whether the result is stateful, and the page needs to know, because it has to drive a stateless graph differently. The graph itself is the same either way: when `isStateful` is false, the page binds the cache inputs and outputs and carries the cache between dispatches, exactly as it would without KV cache pairs. We considered having WebNN emulate state when the underlying implementation has none, so that `isStateful` would not be needed; see [Emulate state in WebNN](#emulate-state-in-webnn) for why we did not.
 
@@ -422,7 +425,7 @@ How the page binds a graph depends on what was built:
 The pairs are removed rather than silently ignored on purpose. An ignored cache output would never be written, so a page that wrongly carried the cache itself would read stale or zero data with no error, and would keep allocating a past and a present tensor per layer, which is exactly the memory the stateful model is meant to save. Rejecting the binding exposes that mistake on the first dispatch.
 
 ### Metadata design
-The stateful model changes what a dispatch binds; metadata must never change what a graph computes, only how well it runs. The rules that keep it from becoming a backdoor:
+Metadata must never change what a graph computes, only how well it runs. The rules that keep it from becoming a backdoor:
 
 - **Metadata is a hint, never a semantic.** Metadata must never change *what a graph computes*: whenever a dispatch succeeds, its outputs are the same whether the underlying implementation used every member or ignored them all. It may change *how fast* the graph runs, *how much memory* it takes, and the *resource limits* it runs within — most importantly the KV cache capacity, and with it the longest prompt or context at which a dispatch fails rather than succeeds. Such a failure is a resource limit of the underlying implementation, like running out of device memory, not a difference in semantics: every underlying implementation has some limit, and metadata only lets the page move it toward what it actually needs. This is what lets the same page run on an underlying implementation that has never heard of a given member.
 
@@ -456,9 +459,12 @@ The ONNX format has no notion of state, so whether a pair can become state depen
 Across the three, the pairs become states, variables, or a naming convention, and the metadata becomes a fixed capacity or a pair of compile options.
 
 ## Implementation Experience: OpenVINO on Intel NPU
-The previous sections describe what a page declares. This section shows what an underlying implementation can do with it, using our proof of concept on an Intel NPU. The WebNN graph is converted to an OpenVINO model and compiled by the NPU plugin through <a id="npuw"></a>**NPUW** (NPU Wrapper), the plugin's execution path for LMs. The optimizations described below are visible to the page only through performance and resource limits: they never change what the graph computes. A page builds the graph as described in [Proposed API](#proposed-api), and [NPUW](#npuw) applies these optimizations underneath.
+The previous sections describe what a page declares. This section shows what an underlying implementation can do with it, using our proof of concept on an Intel NPU. The WebNN graph is converted to an OpenVINO model and compiled by the NPU plugin. The optimizations described below are visible to the page only through performance and resource limits: they never change what the graph computes. A page builds the graph as described in [Proposed API](#proposed-api), and the implementation applies these optimizations underneath.
 
-The framing: an NPU is a compile-ahead accelerator. It reaches peak efficiency when the schedule, the tiling, and the memory plan are all fixed before execution. [NPUW](#npuw) never compiles a dynamic graph. It compiles a small, fixed set of static models up front and turns every source of dynamism — the prompt length, the growing cache, the current position in the conversation — into padding, masking, and host-side bookkeeping. Each of the three subsections below corresponds to one of the mechanisms above: static decomposition absorbs flexible input shapes and consumes the metadata, KV cache management implements the stateful model, and pattern matching stands in for the subgraphs that WebNN does not yet have.
+### NPUW
+NPUW (NPU Wrapper) is the NPU plugin's execution path for LMs. It sits between the OpenVINO model and the NPU driver, and exists because an NPU is a compile-ahead accelerator: it reaches peak efficiency only when the schedule, the tiling, and the memory plan are all fixed before execution. NPUW therefore never compiles a dynamic graph. It turns the model into a small, fixed set of static models compiled up front, and turns every source of dynamism — the prompt length, the growing cache, the current position in the conversation — into padding, masking, and host-side bookkeeping.
+
+Each of the subsections below corresponds to one of the mechanisms above: static decomposition absorbs flexible input shapes and consumes the metadata, KV cache management implements the stateful model, and pattern matching stands in for the subgraphs that WebNN does not yet have.
 
 ### Static decomposition
 [NPUW](#npuw) splits the LM into separately compiled static models:
@@ -499,7 +505,7 @@ This is the underlying implementation's view of why the stateful model matters. 
 
 - **Quantized weights.** OpenVINO has no MatMulNBits operator; an int4 weight appears as `Constant(u4) → Convert → Subtract → Multiply → MatMul`. How that chain runs depends on the configuration and on the chain being recognized. With `NPUW_DQ`, [NPUW](#npuw) rewrites a matched chain so the low-precision weight feeds the MatMul directly and the scale is applied afterwards, splitting group-quantized weights into per-group MatMuls. Without compiler-side dynamic quantization, DCOFF (decompression cut-off) instead converts the weights to fp16 on the host before execution. On devices that support it, the compiler's own dynamic quantization takes over. Models for the NPU are expected to be exported with symmetric INT4 or NF4 weights, channel-wise or with a group size of 128.
 
-Every one of these optimizations depends on finding a pattern in a graph that was built from primitives. That is the situation described in [Composite operators and subgraphs](#composite-operators-and-subgraphs): each matcher targets specific graph forms, so a framework that lowers the same computation differently can miss them, and nothing reports that a match was missed — the graph simply runs on the slower path. A standard subgraph definition would not remove the need to recognize the pattern, but it would fix what has to be recognized: frameworks would emit one documented form, and each underlying implementation would match that form instead of guessing at every possible lowering.
+Every one of these optimizations depends on finding a pattern in a graph that was built from primitives. That is the situation described in [Composite operators and subgraphs](#composite-operators-and-subgraphs): each matcher targets specific graph forms, so a framework that lowers the same computation differently can miss them, and nothing reports that a match was missed — the graph simply runs on the slower path. A standard subgraph definition would not remove the need to recognize the pattern, but it would fix what has to be recognized: frameworks would emit one documented form, and each underlying implementation would match that form instead of guessing at every possible form.
 
 ## Considered Alternatives
 The alternatives below were considered for the two additions this explainer proposes. The first six concern how the KV cache is kept across dispatches; the last two concern how usage intent is passed down.
@@ -533,7 +539,12 @@ WebNN could keep the cache tensors itself and rebind them on every dispatch when
 ### Bounded dimensions instead of metadata
 Instead of metadata, the page could bound its dynamic dimensions, for example by declaring that `'seq_len'` is at most 2048 and `'total_len'` at most 2304. Bounded (min/max) dimensions are listed as a future consideration in the [Dynamic Shape explainer](https://github.com/webmachinelearning/webnn/blob/main/dynamic-shape-explainer.md), and they could carry the same two numbers as `maxPromptLength` and `minResponseLength`.
 
-We did not choose them because a bound and a hint promise different things. A bound is a guarantee: every underlying implementation accepts every shape within it and rejects every shape beyond it, and one that cannot support the bound can reject the build up front. Metadata promises nothing: an underlying implementation may size its capacity from it, from its own defaults, or grow on demand, so the point at which a long context fails is implementation-dependent. Bounds also describe which shapes are legal, not how the page will use them, so they cannot grow to carry intent that is not a shape limit. The two can coexist: if bounded dimensions are adopted, an underlying implementation could size its models from them in the same way, and whether a page should be able to require a capacity is listed in [Open Questions](#open-questions).
+Both can fail on a long context: with metadata the failure is a resource limit of the underlying implementation, as described in [Metadata design](#metadata-design), and with a bound it is part of the contract. We did not choose bounds because they promise more than we want to require, and because they carry less than the page knows.
+
+- **A bound is a guarantee in both directions.** Every underlying implementation must accept every shape within it and reject every shape beyond it, and one that cannot support the bound must reject the build up front. That makes a page's stated size a requirement on every implementation, and it forbids an implementation that has spare capacity from accepting a longer context. `maxPromptLength` only asks for at least that much room: an implementation may size from it, from its own defaults, or grow on demand, and may ignore it.
+- **A bound loses the split.** A bound on `'total_len'` keeps the sum of the two numbers but not how it divides between the prompt and the reserved response. The underlying implementation can use the split, for example to size a prefill model from the prompt length alone, and a bound cannot carry intent that is not a shape limit.
+
+The two can coexist: if bounded dimensions are adopted, an underlying implementation could size its models from them in the same way, and whether a page should be able to require a capacity is listed in [Open Questions](#open-questions).
 
 ### Free-form or vendor-specific metadata keys
 Metadata could be a `record<DOMString, any>` that accepts any key, so that a page could pass, for example, NPUW options directly. We rejected it because such keys are meaningful to one underlying implementation only, would tie a page to a single device, and would grow into an unbounded configuration surface. Restricting a record to a list of registered keys does not help either: rejecting an unknown key breaks a newer page on an older browser, and ignoring it loses the type checking that WebIDL gives a dictionary member for free. A dictionary with fixed members keeps both, and only members that are meaningful to every underlying implementation, such as `maxPromptLength` and `minResponseLength`, are defined; each underlying implementation maps them onto its own configuration.
@@ -574,6 +585,8 @@ The proposed API covers the two use cases with the smallest surface we could fin
 - **How are KV cache capacities negotiated?** The current sketch lets the underlying implementation size the cache, for example from `maxPromptLength` and `minResponseLength`. Should `MLKVCachePair` instead carry an explicit maximum, so a page can state the context length it intends to support and get a clean failure at build time instead of at some later dispatch? Today a page that sets `maxPromptLength` has no way to know whether the underlying implementation honored it, and discovers a too-small capacity only when a dispatch fails. This overlaps with bounded (min/max) dimensions; see [Bounded dimensions instead of metadata](#bounded-dimensions-instead-of-metadata).
 
 - **Should a page be able to require a stateful graph?** Today `useStateful: true` is a request, and the page learns the result from `isStateful`. Some pages may prefer a build that rejects when state is unavailable, rather than a stateless graph they then have to drive differently.
+
+- **Should a page be able to query the current length and the capacity of a KV cache?** The cache is managed by the underlying implementation and is never exposed as a tensor, so a page cannot see how much of it is used or how much room is left. It can count the tokens it has dispatched, but that count can diverge from the real length after a failed dispatch or when the page did not supply metadata and the implementation chose its own default capacity. A read-only query, for example on `MLGraph`, would let a page check its own bookkeeping and decide ahead of time whether to trim or summarize the history before a dispatch fails for lack of capacity. The open points are what unit a capacity is expressed in, since backends may size caches differently; whether every backend can report a meaningful value; and whether a device-dependent default capacity adds to what a page can learn about the device, which would need review under [Privacy & Security Considerations](#privacy--security-considerations).
 
 - **Should the form of the cache update be standardized?** The update depends on the underlying implementation recognizing how the graph appends to the cache, and what happens with a form it does not recognize is specific to each underlying implementation and may not be visible to the page. Should the form be standardized, for example through the composite operators and subgraphs of [webmachinelearning/webnn#907](https://github.com/webmachinelearning/webnn/issues/907), so that recognizing a pattern becomes following a convention? Should a page be able to learn that the underlying implementation did not recognize the form?
 

@@ -39,9 +39,9 @@
   <text class="label" x="720" y="32" text-anchor="middle">LM-specific operators</text>
   <text class="sub" x="720" y="50" text-anchor="middle">Attention · RoPE · Norm · MatMulNBits</text>
 
-  <!-- ===================== WebNN mechanisms ===================== -->
+  <!-- ===================== WebNN proposals ===================== -->
   <text class="group" x="10" y="142">WebNN</text>
-  <text class="group" x="10" y="158">mechanisms</text>
+  <text class="group" x="10" y="158">proposals</text>
 
   <rect class="api" x="140" y="120" width="220" height="52"/>
   <text class="label" x="250" y="142" text-anchor="middle">Flexible input shapes</text>
